@@ -1,0 +1,264 @@
+name: build-speed-2
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Write source
+        run: |
+          mkdir -p src
+          cat > src/Tweak7.m <<'TWEAK_EOF'
+          //
+          //  Tweak7.m  —  FPS + 倍速 + 时间源诊断（去掉 clock_gettime）
+          //
+          //  M = mach_absolute_time，C = CFAbsoluteTimeGetCurrent
+          //  两个都计数并缩放，面板显示调用次数。
+          //
+
+          #import <UIKit/UIKit.h>
+          #import <QuartzCore/QuartzCore.h>
+          #import <mach/mach_time.h>
+          #import <dlfcn.h>
+          #import <pthread.h>
+          #import <sys/time.h>
+          #import <time.h>
+
+          #pragma mark - 状态
+
+          static pthread_mutex_t gLock = PTHREAD_MUTEX_INITIALIZER;
+          static double gSpeed = 1.0;
+          static int gScaling = 0;
+
+          static volatile uint64_t gCallsM = 0;
+          static volatile uint64_t gCallsC = 0;
+
+          static double gLastSec = 0, gVirtSec = 0;
+          static uint64_t gLastTick = 0, gVirtTick = 0;
+
+          static double scale_sec(double real) {
+              if (!gScaling) return real;
+              pthread_mutex_lock(&gLock);
+              if (gLastSec == 0) { gLastSec = real; gVirtSec = real; }
+              gVirtSec += (real - gLastSec) * gSpeed;
+              gLastSec = real;
+              double out = gVirtSec;
+              pthread_mutex_unlock(&gLock);
+              return out;
+          }
+
+          static uint64_t scale_tick(uint64_t real) {
+              if (!gScaling) return real;
+              pthread_mutex_lock(&gLock);
+              if (gLastTick == 0) { gLastTick = real; gVirtTick = real; }
+              uint64_t d = real - gLastTick;
+              gVirtTick += (uint64_t)((double)d * gSpeed);
+              gLastTick = real;
+              uint64_t out = gVirtTick;
+              pthread_mutex_unlock(&gLock);
+              return out;
+          }
+
+          #pragma mark - mach_absolute_time
+
+          typedef uint64_t (*mach_abs_fn)(void);
+          static mach_abs_fn gOrigMach = NULL;
+
+          uint64_t my_mach_absolute_time(void) {
+              gCallsM = gCallsM + 1;
+              uint64_t real = gOrigMach ? gOrigMach() : 0;
+              if (!real) __asm__ volatile("mrs %0, cntvct_el0" : "=r"(real));
+              return scale_tick(real);
+          }
+
+          #pragma mark - CFAbsoluteTimeGetCurrent
+
+          typedef double (*cfabs_fn)(void);
+          static cfabs_fn gOrigCFAbs = NULL;
+
+          double my_CFAbsoluteTimeGetCurrent(void) {
+              gCallsC = gCallsC + 1;
+              double real = gOrigCFAbs ? gOrigCFAbs() : 0.0;
+              return scale_sec(real);
+          }
+
+          __attribute__((used, section("__DATA,__interpose")))
+          static const struct { void *replacement; void *original; } interposers[] = {
+              { (void *)my_mach_absolute_time, (void *)mach_absolute_time },
+              { (void *)my_CFAbsoluteTimeGetCurrent, (void *)CFAbsoluteTimeGetCurrent }
+          };
+
+          #pragma mark - 帧率
+
+          static volatile NSUInteger gTicks = 0;
+          static UILabel *gLabel = nil;
+          static UIButton *gSpeedBtn = nil;
+          static UIButton *gHideBtn = nil;
+          static UIView *gPanel = nil;
+          static CADisplayLink *gLink = nil;
+
+          @interface Tick : NSObject
+          + (instancetype)shared;
+          - (void)onTick:(CADisplayLink *)link;
+          - (void)onPan:(UIPanGestureRecognizer *)g;
+          @end
+
+          @implementation Tick
+          + (instancetype)shared {
+              static Tick *s = nil;
+              static dispatch_once_t once;
+              dispatch_once(&once, ^{ s = [Tick new]; });
+              return s;
+          }
+          - (void)onTick:(CADisplayLink *)l { gTicks = gTicks + 1; }
+          - (void)onPan:(UIPanGestureRecognizer *)g {
+              UIView *v = g.view, *sup = v.superview;
+              if (!v || !sup) return;
+              CGPoint t = [g translationInView:sup];
+              CGPoint c = v.center;
+              c.x += t.x; c.y += t.y;
+              CGFloat hw = v.bounds.size.width / 2, hh = v.bounds.size.height / 2;
+              c.x = MAX(hw + 4, MIN(sup.bounds.size.width - hw - 4, c.x));
+              c.y = MAX(hh + 4, MIN(sup.bounds.size.height - hh - 4, c.y));
+              v.center = c;
+              [g setTranslation:CGPointMake(0.0, 0.0) inView:sup];
+          }
+          @end
+
+          static UIWindow *keyWindow(void) {
+              UIWindow *win = nil;
+              if (@available(iOS 13.0, *)) {
+                  for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+                      if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+                      for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+                          if (w.isKeyWindow) { win = w; break; }
+                      }
+                      if (win) break;
+                  }
+              }
+              if (!win) {
+                  for (UIWindow *w in [UIApplication sharedApplication].windows) {
+                      if (w.isKeyWindow) { win = w; break; }
+                  }
+              }
+              if (!win) win = [UIApplication sharedApplication].keyWindow;
+              return win;
+          }
+
+          static UIButton *mkBtn(NSString *t, SEL s, CGRect f) {
+              UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+              b.frame = f;
+              b.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.55];
+              b.layer.cornerRadius = 6;
+              b.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+              [b setTitle:t forState:UIControlStateNormal];
+              [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+              [b addTarget:nil action:s forControlEvents:UIControlEventTouchUpInside];
+              return b;
+          }
+
+          static void makeUI(void) {
+              UIWindow *win = keyWindow();
+              if (!win) return;
+
+              UIView *panel = [[UIView alloc] initWithFrame:CGRectMake(14, 44, 250, 34)];
+              [win addSubview:panel];
+              gPanel = panel;
+              [panel addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:[Tick shared]
+                                                                                 action:@selector(onPan:)]];
+
+              UILabel *lab = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 150, 26)];
+              lab.text = @"-- FPS";
+              lab.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
+              lab.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.55];
+              lab.font = [UIFont fontWithName:@"Menlo" size:11] ?: [UIFont systemFontOfSize:11];
+              lab.textAlignment = NSTextAlignmentCenter;
+              lab.layer.cornerRadius = 6;
+              lab.layer.masksToBounds = YES;
+              lab.userInteractionEnabled = NO;
+              [panel addSubview:lab];
+              gLabel = lab;
+
+              gSpeedBtn = mkBtn(@"1.0x", @selector(spdTap:), CGRectMake(154, 0, 52, 26));
+              [panel addSubview:gSpeedBtn];
+              gHideBtn = mkBtn(@"隐藏", @selector(hideTap:), CGRectMake(210, 0, 40, 26));
+              [panel addSubview:gHideBtn];
+
+              gLink = [CADisplayLink displayLinkWithTarget:[Tick shared] selector:@selector(onTick:)];
+              [gLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+          }
+
+          @interface NSObject (Actions7)
+          - (void)spdTap:(id)s;
+          - (void)hideTap:(id)s;
+          @end
+
+          @implementation NSObject (Actions7)
+          - (void)spdTap:(id)s {
+              double next = 1.0;
+              if (gSpeed < 1.5) next = 2.0;
+              else if (gSpeed < 2.5) next = 3.0;
+              else next = 1.0;
+
+              pthread_mutex_lock(&gLock);
+              gSpeed = next;
+              gScaling = (next > 1.0001) ? 1 : 0;
+              gLastSec = 0; gVirtSec = 0;
+              gLastTick = 0; gVirtTick = 0;
+              pthread_mutex_unlock(&gLock);
+
+              [gSpeedBtn setTitle:[NSString stringWithFormat:@"%.1fx", next] forState:UIControlStateNormal];
+          }
+          - (void)hideTap:(id)s {
+              BOOL h = gLabel.hidden;
+              gLabel.hidden = !h;
+              [gHideBtn setTitle:(h ? @"隐藏" : @"显示") forState:UIControlStateNormal];
+          }
+          @end
+
+          __attribute__((constructor))
+          static void init7(void) {
+              gOrigMach = (mach_abs_fn)dlsym(RTLD_NEXT, "mach_absolute_time");
+              gOrigCFAbs = (cfabs_fn)dlsym(RTLD_NEXT, "CFAbsoluteTimeGetCurrent");
+
+              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                             dispatch_get_main_queue(), ^{ makeUI(); });
+
+              NSTimer *t = [NSTimer timerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *tm) {
+                  static NSUInteger last = 0;
+                  NSUInteger now = gTicks;
+                  NSUInteger d = now - last;
+                  last = now;
+                  if (gLabel) {
+                      gLabel.text = [NSString stringWithFormat:@"%lu FPS M:%llu C:%llu",
+                                     (unsigned long)d,
+                                     (unsigned long long)gCallsM,
+                                     (unsigned long long)gCallsC];
+                  }
+              }];
+              [[NSRunLoop mainRunLoop] addTimer:t forMode:NSRunLoopCommonModes];
+          }
+          TWEAK_EOF
+          wc -l src/Tweak7.m
+
+      - name: Build
+        run: |
+          set -e
+          mkdir -p out
+          xcrun --sdk iphoneos clang \
+            -arch arm64 -dynamiclib -O2 -fobjc-arc \
+            -miphoneos-version-min=12.0 \
+            -install_name "@executable_path/Tweak7.dylib" \
+            -framework UIKit -framework Foundation -framework QuartzCore -framework CoreGraphics -framework CoreFoundation \
+            -o out/Tweak7.dylib src/Tweak7.m
+          xcrun lipo -info out/Tweak7.dylib
+          ls -la out
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-dylibs
+          path: out/*.dylib
+          if-no-files-found: error
