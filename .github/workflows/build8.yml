@@ -1,0 +1,352 @@
+name: build-tweak7
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Write source
+        run: |
+          mkdir -p src
+          cat > src/Tweak4.m <<'TWEAK_EOF'
+          //
+          //  Tweak4.m  —  FPS + 可拖动面板 + 角落遮罩 + 数值搜索
+          //
+
+          #import <UIKit/UIKit.h>
+          #import <QuartzCore/QuartzCore.h>
+          #import <objc/runtime.h>
+          #import <mach/mach.h>
+          #import <pthread.h>
+          #import <stdio.h>
+
+          #pragma mark - 全局
+
+          static UILabel *gFpsLabel = nil;
+          static UIButton *gSpeedBtn = nil;
+          static UIButton *gHideBtn = nil;
+          static UIButton *gMaskBtn = nil;
+          static UIButton *gScanBtn = nil;
+          static UIView *gPanel = nil;
+          static UIView *gMaskL = nil;
+          static UIView *gMaskR = nil;
+          static CADisplayLink *gLink = nil;
+          static volatile NSUInteger gTicks = 0;
+
+          #define MAX_MATCHES 4096
+          static uint64_t gMatches[MAX_MATCHES];
+          static int gMatchCount = 0;
+          static int32_t gLastQuery = 0;
+
+          #pragma mark - 帧率
+
+          @interface TickTarget : NSObject
+          + (instancetype)shared;
+          - (void)onTick:(CADisplayLink *)link;
+          - (void)onPan:(UIPanGestureRecognizer *)g;
+          @end
+
+          @implementation TickTarget
+          + (instancetype)shared {
+              static TickTarget *s = nil;
+              static dispatch_once_t once;
+              dispatch_once(&once, ^{ s = [TickTarget new]; });
+              return s;
+          }
+          - (void)onTick:(CADisplayLink *)link { gTicks = gTicks + 1; }
+          - (void)onPan:(UIPanGestureRecognizer *)g {
+              UIView *v = g.view;
+              UIView *sup = v.superview;
+              if (!v || !sup) return;
+              CGPoint t = [g translationInView:sup];
+              CGPoint c = v.center;
+              c.x += t.x; c.y += t.y;
+              CGFloat hw = v.bounds.size.width / 2, hh = v.bounds.size.height / 2;
+              c.x = MAX(hw + 4, MIN(sup.bounds.size.width - hw - 4, c.x));
+              c.y = MAX(hh + 4, MIN(sup.bounds.size.height - hh - 4, c.y));
+              v.center = c;
+              [g setTranslation:CGPointMake(0.0, 0.0) inView:sup];
+          }
+          @end
+
+          #pragma mark - 内存搜索
+
+          static void scan_all(int32_t target) {
+              gMatchCount = 0;
+              vm_address_t addr = 0;
+              vm_size_t size = 0;
+              natural_t depth = 1;
+
+              while (1) {
+                  vm_region_submap_info_data_64_t info;
+                  mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+                  kern_return_t kr = vm_region_recurse_64(mach_task_self(), &addr, &size, &depth,
+                                                          (vm_region_recurse_info_t)&info, &count);
+                  if (kr != KERN_SUCCESS) break;
+
+                  if ((info.protection & VM_PROT_WRITE) && (info.protection & VM_PROT_READ) &&
+                      !(info.protection & VM_PROT_EXECUTE) && size > 0 && size <= (512ULL << 20)) {
+
+                      vm_offset_t data = 0;
+                      mach_msg_type_number_t sz = 0;
+                      if (vm_read(mach_task_self(), addr, (vm_size_t)size, &data, &sz) == KERN_SUCCESS) {
+                          uint8_t *p = (uint8_t *)data;
+                          for (vm_size_t i = 0; i + 4 <= size; i += 4) {
+                              int32_t v;
+                              memcpy(&v, p + i, 4);
+                              if (v == target) {
+                                  if (gMatchCount < MAX_MATCHES) {
+                                      gMatches[gMatchCount++] = (uint64_t)(addr + i);
+                                  }
+                              }
+                          }
+                          vm_deallocate(mach_task_self(), data, sz);
+                      }
+                  }
+                  addr += size;
+                  if (addr < size) break;
+              }
+          }
+
+          static void filter_all(int32_t target) {
+              int w = 0;
+              for (int i = 0; i < gMatchCount; i++) {
+                  int32_t v = 0;
+                  vm_size_t got = 0;
+                  if (vm_read_overwrite(mach_task_self(), (vm_address_t)gMatches[i], 4,
+                                        (vm_address_t)&v, &got) == KERN_SUCCESS && got == 4) {
+                      if (v == target) gMatches[w++] = gMatches[i];
+                  }
+              }
+              gMatchCount = w;
+          }
+
+          static int write_all(int32_t value) {
+              int ok = 0;
+              for (int i = 0; i < gMatchCount; i++) {
+                  if (vm_write(mach_task_self(), (vm_address_t)gMatches[i],
+                               (vm_offset_t)&value, 4) == KERN_SUCCESS) {
+                      ok++;
+                  }
+              }
+              return ok;
+          }
+
+          #pragma mark - UI
+
+          static UIWindow *keyWindow(void) {
+              UIWindow *win = nil;
+              if (@available(iOS 13.0, *)) {
+                  for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+                      if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+                      for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+                          if (w.isKeyWindow) { win = w; break; }
+                      }
+                      if (win) break;
+                  }
+              }
+              if (!win) {
+                  for (UIWindow *w in [UIApplication sharedApplication].windows) {
+                      if (w.isKeyWindow) { win = w; break; }
+                  }
+              }
+              if (!win) win = [UIApplication sharedApplication].keyWindow;
+              return win;
+          }
+
+          static UIButton *makeButton(NSString *title, SEL sel, CGRect frame) {
+              UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+              b.frame = frame;
+              b.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.55];
+              b.layer.cornerRadius = 6;
+              b.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+              [b setTitle:title forState:UIControlStateNormal];
+              [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+              [b addTarget:nil action:sel forControlEvents:UIControlEventTouchUpInside];
+              return b;
+          }
+
+          static void showAlert(NSString *title, NSString *msg) {
+              UIAlertController *a = [UIAlertController alertControllerWithTitle:title
+                                                                        message:msg
+                                                                 preferredStyle:UIAlertControllerStyleAlert];
+              [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+              [[keyWindow() rootViewController] presentViewController:a animated:YES completion:nil];
+          }
+
+          static void promptNumber(NSString *title, NSString *placeholder, void (^handler)(int32_t)) {
+              UIAlertController *a = [UIAlertController alertControllerWithTitle:title
+                                                                        message:nil
+                                                                 preferredStyle:UIAlertControllerStyleAlert];
+              [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+                  tf.keyboardType = UIKeyboardTypeNumberPad;
+                  tf.placeholder = placeholder;
+              }];
+              [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+              [a addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction *act) {
+                  int32_t v = (int32_t)[a.textFields.firstObject.text intValue];
+                  handler(v);
+              }]];
+              [[keyWindow() rootViewController] presentViewController:a animated:YES completion:nil];
+          }
+
+          static void makeUI(void) {
+              UIWindow *win = keyWindow();
+              if (!win) return;
+
+              UIView *panel = [[UIView alloc] initWithFrame:CGRectMake(14, 44, 210, 96)];
+              [win addSubview:panel];
+              gPanel = panel;
+              [panel addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:[TickTarget shared]
+                                                                                 action:@selector(onPan:)]];
+
+              UILabel *lab = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 96, 26)];
+              lab.text = @"-- FPS";
+              lab.textColor = [UIColor colorWithRed:0.4 green:1.0 blue:0.4 alpha:1.0];
+              lab.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.5];
+              lab.font = [UIFont fontWithName:@"Menlo-Bold" size:15] ?: [UIFont boldSystemFontOfSize:15];
+              lab.textAlignment = NSTextAlignmentCenter;
+              lab.layer.cornerRadius = 6;
+              lab.layer.masksToBounds = YES;
+              lab.userInteractionEnabled = NO;
+              [panel addSubview:lab];
+              gFpsLabel = lab;
+
+              gSpeedBtn = makeButton(@"搜索", @selector(tweakScanTapped:), CGRectMake(100, 0, 52, 26));
+              [panel addSubview:gSpeedBtn];
+              gHideBtn = makeButton(@"隐藏", @selector(tweakHideTapped:), CGRectMake(156, 0, 52, 26));
+              [panel addSubview:gHideBtn];
+
+              UIButton *flt = makeButton(@"筛选", @selector(tweakFilterTapped:), CGRectMake(0, 32, 52, 30));
+              [panel addSubview:flt];
+              UIButton *wrt = makeButton(@"写入", @selector(tweakWriteTapped:), CGRectMake(56, 32, 52, 30));
+              [panel addSubview:wrt];
+              gMaskBtn = makeButton(@"遮罩", @selector(tweakMaskTapped:), CGRectMake(112, 32, 52, 30));
+              [panel addSubview:gMaskBtn];
+              UIButton *cnt = makeButton(@"清空", @selector(tweakClearTapped:), CGRectMake(168, 32, 40, 30));
+              [panel addSubview:cnt];
+
+              UIView *ml = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 190, 76)];
+              ml.backgroundColor = [UIColor colorWithWhite:0.08 alpha:1.0];
+              ml.hidden = YES;
+              [win addSubview:ml];
+              gMaskL = ml;
+
+              UIView *mr = [[UIView alloc] initWithFrame:CGRectMake(win.bounds.size.width - 190, 0, 190, 76)];
+              mr.backgroundColor = [UIColor colorWithWhite:0.08 alpha:1.0];
+              mr.hidden = YES;
+              mr.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
+              [win addSubview:mr];
+              gMaskR = mr;
+
+              gLink = [CADisplayLink displayLinkWithTarget:[TickTarget shared] selector:@selector(onTick:)];
+              [gLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+          }
+
+          #pragma mark - actions
+
+          @interface NSObject (TweakActions4)
+          - (void)tweakScanTapped:(id)sender;
+          - (void)tweakFilterTapped:(id)sender;
+          - (void)tweakWriteTapped:(id)sender;
+          - (void)tweakMaskTapped:(id)sender;
+          - (void)tweakClearTapped:(id)sender;
+          - (void)tweakHideTapped:(id)sender;
+          @end
+
+          @implementation NSObject (TweakActions4)
+
+          - (void)tweakScanTapped:(id)sender {
+              promptNumber(@"搜索数值", @"例如当前金币", ^(int32_t v) {
+                  gLastQuery = v;
+                  dispatch_async(dispatch_get_global_queue(0, 0), ^{
+                      scan_all(v);
+                      dispatch_async(dispatch_get_main_queue(), ^{
+                          showAlert(@"搜索完成", [NSString stringWithFormat:@"找到 %d 个地址\n\n改变游戏内数值后，点「筛选」再搜一次", gMatchCount]);
+                      });
+                  });
+              });
+          }
+
+          - (void)tweakFilterTapped:(id)sender {
+              if (gMatchCount <= 0) { showAlert(@"提示", @"还没搜索结果"); return; }
+              promptNumber(@"筛选", @"输入变化后的数值", ^(int32_t v) {
+                  dispatch_async(dispatch_get_global_queue(0, 0), ^{
+                      filter_all(v);
+                      dispatch_async(dispatch_get_main_queue(), ^{
+                          showAlert(@"筛选完成", [NSString stringWithFormat:@"剩余 %d 个地址", gMatchCount]);
+                      });
+                  });
+              });
+          }
+
+          - (void)tweakWriteTapped:(id)sender {
+              if (gMatchCount <= 0) { showAlert(@"提示", @"没有可写入的地址"); return; }
+              promptNumber(@"写入新值", @"输入想要的值", ^(int32_t v) {
+                  int ok = write_all(v);
+                  showAlert(@"写入完成", [NSString stringWithFormat:@"成功写入 %d 处", ok]);
+              });
+          }
+
+          - (void)tweakMaskTapped:(id)sender {
+              BOOL show = gMaskL.hidden;
+              gMaskL.hidden = !show;
+              gMaskR.hidden = !show;
+              [gMaskBtn setTitle:(show ? @"取消遮罩" : @"遮罩") forState:UIControlStateNormal];
+          }
+
+          - (void)tweakClearTapped:(id)sender {
+              gMatchCount = 0;
+              showAlert(@"已清空", @"结果列表已清空");
+          }
+
+          - (void)tweakHideTapped:(id)sender {
+              BOOL hidden = gFpsLabel.hidden;
+              for (UIView *v in gPanel.subviews) v.hidden = !hidden;
+              gFpsLabel.hidden = !hidden;
+              [gHideBtn setTitle:(hidden ? @"隐藏" : @"显示") forState:UIControlStateNormal];
+          }
+          @end
+
+          #pragma mark - 启动
+
+          __attribute__((constructor))
+          static void tweak4_init(void) {
+              dispatch_async(dispatch_get_main_queue(), ^{
+                  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                                 dispatch_get_main_queue(), ^{ makeUI(); });
+              });
+
+              NSTimer *timer = [NSTimer timerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
+                  static NSUInteger last = 0;
+                  NSUInteger now = gTicks;
+                  NSUInteger d = now - last;
+                  last = now;
+                  if (gFpsLabel) gFpsLabel.text = [NSString stringWithFormat:@"%lu FPS", (unsigned long)d];
+              }];
+              [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
+          }
+          TWEAK_EOF
+          wc -l src/Tweak4.m
+
+      - name: Build
+        run: |
+          set -e
+          mkdir -p out
+          xcrun --sdk iphoneos clang \
+            -arch arm64 -dynamiclib -O2 -fobjc-arc \
+            -miphoneos-version-min=12.0 \
+            -install_name "@executable_path/Tweak4.dylib" \
+            -framework UIKit -framework Foundation -framework QuartzCore -framework CoreGraphics \
+            -o out/Tweak4.dylib src/Tweak4.m
+          xcrun lipo -info out/Tweak4.dylib
+          ls -la out
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-dylibs
+          path: out/*.dylib
+          if-no-files-found: error
