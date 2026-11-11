@@ -1,0 +1,194 @@
+name: build-ios-dylib
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Write source
+        run: |
+          mkdir -p src
+          cat > src/Tweak.m <<'TWEAK_EOF'
+          //
+          //  Tweak.m  —  FPS 显示 + 倍速切换
+          //
+          //  FPS：hook EAGLContext presentRenderbuffer:，统计每秒提交次数
+          //  倍速：直接调用 Unity 内部的 set_timeScale 入口（固定偏移 0x44f58c）
+          //
+
+          #import <UIKit/UIKit.h>
+          #import <QuartzCore/QuartzCore.h>
+          #import <OpenGLES/EAGL.h>
+          #import <objc/runtime.h>
+          #import <mach-o/dyld.h>
+
+          #define SET_TIMESCALE_OFFSET 0x44f58cULL
+          #define IMAGE_VMADDR         0x100000000ULL
+
+          static volatile NSUInteger gFrameCount = 0;
+          static UILabel *gFpsLabel = nil;
+          static UIButton *gSpeedBtn = nil;
+          static UIButton *gHideBtn = nil;
+          static float gSpeed = 1.0f;
+
+          #pragma mark - FPS hook
+
+          @interface EAGLContext (FPSHook)
+          - (BOOL)fps_presentRenderbuffer:(NSUInteger)target;
+          @end
+
+          @implementation EAGLContext (FPSHook)
+          - (BOOL)fps_presentRenderbuffer:(NSUInteger)target {
+              gFrameCount = gFrameCount + 1;
+              return [self fps_presentRenderbuffer:target];
+          }
+          @end
+
+          static void installSwizzle(void) {
+              Class cls = objc_getClass("EAGLContext");
+              if (cls == Nil) return;
+              Method orig = class_getInstanceMethod(cls, @selector(presentRenderbuffer:));
+              Method repl = class_getInstanceMethod(cls, @selector(fps_presentRenderbuffer:));
+              if (orig && repl) method_exchangeImplementations(orig, repl);
+          }
+
+          #pragma mark - 倍速
+
+          static float applySpeed(float s) {
+              intptr_t slide = _dyld_get_image_vmaddr_slide(0);
+              void *fn = (void *)(uintptr_t)(IMAGE_VMADDR + SET_TIMESCALE_OFFSET + (uint64_t)slide);
+              if (!fn) return gSpeed;
+              ((void (*)(float))fn)(s);
+              gSpeed = s;
+              return gSpeed;
+          }
+
+          #pragma mark - UI
+
+          static UIWindow *keyWindow(void) {
+              UIWindow *win = nil;
+              if (@available(iOS 13.0, *)) {
+                  for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+                      if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+                      for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+                          if (w.isKeyWindow) { win = w; break; }
+                      }
+                      if (win) break;
+                  }
+              }
+              if (!win) {
+                  for (UIWindow *w in [UIApplication sharedApplication].windows) {
+                      if (w.isKeyWindow) { win = w; break; }
+                  }
+              }
+              if (!win) win = [UIApplication sharedApplication].keyWindow;
+              return win;
+          }
+
+          static UIButton *makeButton(NSString *title, SEL sel, CGRect frame) {
+              UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+              b.frame = frame;
+              b.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.55];
+              b.layer.cornerRadius = 6;
+              b.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+              [b setTitle:title forState:UIControlStateNormal];
+              [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+              [b addTarget:nil action:sel forControlEvents:UIControlEventTouchUpInside];
+              return b;
+          }
+
+          static void makeUI(void) {
+              UIWindow *win = keyWindow();
+              if (!win) return;
+
+              CGFloat top = 44;
+              UILabel *lab = [[UILabel alloc] initWithFrame:CGRectMake(14, top, 96, 26)];
+              lab.text = @"-- FPS";
+              lab.textColor = [UIColor colorWithRed:0.4 green:1.0 blue:0.4 alpha:1.0];
+              lab.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.5];
+              lab.font = [UIFont fontWithName:@"Menlo-Bold" size:15] ?: [UIFont boldSystemFontOfSize:15];
+              lab.textAlignment = NSTextAlignmentCenter;
+              lab.layer.cornerRadius = 6;
+              lab.layer.masksToBounds = YES;
+              lab.userInteractionEnabled = NO;
+              [win addSubview:lab];
+              gFpsLabel = lab;
+
+              UIButton *spd = makeButton(@"1.0x", @selector(tweakSpeedTapped:), CGRectMake(14, top + 32, 60, 30));
+              [win addSubview:spd];
+              gSpeedBtn = spd;
+
+              UIButton *hide = makeButton(@"隐藏", @selector(tweakHideTapped:), CGRectMake(82, top + 32, 54, 30));
+              [win addSubview:hide];
+              gHideBtn = hide;
+          }
+
+          @interface NSObject (TweakActions)
+          - (void)tweakSpeedTapped:(id)sender;
+          - (void)tweakHideTapped:(id)sender;
+          @end
+
+          @implementation NSObject (TweakActions)
+          - (void)tweakSpeedTapped:(id)sender {
+              float next = 1.0f;
+              if (gSpeed < 1.5f) next = 2.0f;
+              else if (gSpeed < 2.5f) next = 3.0f;
+              else next = 1.0f;
+              float now = applySpeed(next);
+              [gSpeedBtn setTitle:[NSString stringWithFormat:@"%.1fx", now] forState:UIControlStateNormal];
+          }
+
+          - (void)tweakHideTapped:(id)sender {
+              BOOL hidden = gFpsLabel.hidden;
+              gFpsLabel.hidden = !hidden;
+              gSpeedBtn.hidden = !hidden;
+              [gHideBtn setTitle:(hidden ? @"隐藏" : @"显示") forState:UIControlStateNormal];
+          }
+          @end
+
+          #pragma mark - 启动
+
+          __attribute__((constructor))
+          static void tweak_init(void) {
+              installSwizzle();
+
+              dispatch_async(dispatch_get_main_queue(), ^{
+                  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                                 dispatch_get_main_queue(), ^{
+                      makeUI();
+                  });
+              });
+
+              NSTimer *timer = [NSTimer timerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
+                  static NSUInteger last = 0;
+                  NSUInteger now = gFrameCount;
+                  NSUInteger delta = now - last;
+                  last = now;
+                  if (gFpsLabel) gFpsLabel.text = [NSString stringWithFormat:@"%lu FPS", (unsigned long)delta];
+              }];
+              [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
+          }
+          TWEAK_EOF
+          wc -l src/Tweak.m
+
+      - name: Build
+        run: |
+          set -e
+          mkdir -p out
+          xcrun --sdk iphoneos clang \
+            -arch arm64 -dynamiclib -O2 -fobjc-arc \
+            -miphoneos-version-min=12.0 \
+            -install_name "@executable_path/Tweak.dylib" \
+            -framework UIKit -framework Foundation -framework QuartzCore -framework OpenGLES \
+            -o out/Tweak.dylib src/Tweak.m
+          xcrun lipo -info out/Tweak.dylib
+          ls -la out
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-dylibs
+          path: out/*.dylib
+          if-no-files-found: error
