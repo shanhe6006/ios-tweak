@@ -1,0 +1,264 @@
+name: build-tweak3
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Write source
+        run: |
+          mkdir -p src
+          cat > src/Tweak2.m <<'TWEAK_EOF'
+          //
+          //  Tweak2.m  —  FPS 显示 + 倍速（时间插值版）
+          //
+          //  FPS：自建 CADisplayLink 计数，不碰游戏渲染路径
+          //  倍速：通过 __interpose 替换 mach_absolute_time，按比例放大时间增量
+          //
+
+          #import <UIKit/UIKit.h>
+          #import <QuartzCore/QuartzCore.h>
+          #import <objc/runtime.h>
+          #import <mach/mach_time.h>
+          #import <dlfcn.h>
+          #import <pthread.h>
+
+          #pragma mark - 时间插值
+
+          typedef uint64_t (*mach_abs_fn)(void);
+          static mach_abs_fn gOrigMachAbs = NULL;
+          static pthread_mutex_t gTimeLock = PTHREAD_MUTEX_INITIALIZER;
+          static double gSpeed = 1.0;
+          static uint64_t gLastReal = 0;
+          static uint64_t gVirtual = 0;
+          static int gScaling = 0;   // 0 = 原样返回
+
+          uint64_t my_mach_absolute_time(void) {
+              uint64_t real;
+              if (gOrigMachAbs) {
+                  real = gOrigMachAbs();
+              } else {
+                  __asm__ volatile("mrs %0, cntvct_el0" : "=r"(real));
+              }
+
+              if (!gScaling) return real;
+
+              pthread_mutex_lock(&gTimeLock);
+              if (gLastReal == 0) {
+                  gLastReal = real;
+                  gVirtual = real;
+              }
+              uint64_t delta = real - gLastReal;
+              gLastReal = real;
+              gVirtual += (uint64_t)((double)delta * gSpeed);
+              uint64_t out = gVirtual;
+              pthread_mutex_unlock(&gTimeLock);
+              return out;
+          }
+
+          __attribute__((used, section("__DATA,__interpose")))
+          static const struct { void *replacement; void *original; } interposers[] = {
+              { (void *)my_mach_absolute_time, (void *)mach_absolute_time }
+          };
+
+          #pragma mark - 帧率
+
+          static volatile NSUInteger gTicks = 0;
+          static UILabel *gFpsLabel = nil;
+          static UIButton *gSpeedBtn = nil;
+          static UIButton *gHideBtn = nil;
+          static CADisplayLink *gLink = nil;
+
+          @interface TweakTickTarget : NSObject
+          + (instancetype)shared;
+          - (void)onTick:(CADisplayLink *)link;
+          @end
+
+          @implementation TweakTickTarget
+          + (instancetype)shared {
+              static TweakTickTarget *s = nil;
+              static dispatch_once_t once;
+              dispatch_once(&once, ^{ s = [TweakTickTarget new]; });
+              return s;
+          }
+          - (void)onTick:(CADisplayLink *)link { gTicks = gTicks + 1; }
+          @end
+
+          #pragma mark - UI
+
+          static UIWindow *keyWindow(void) {
+              UIWindow *win = nil;
+              if (@available(iOS 13.0, *)) {
+                  for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+                      if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+                      for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+                          if (w.isKeyWindow) { win = w; break; }
+                      }
+                      if (win) break;
+                  }
+              }
+              if (!win) {
+                  for (UIWindow *w in [UIApplication sharedApplication].windows) {
+                      if (w.isKeyWindow) { win = w; break; }
+                  }
+              }
+              if (!win) win = [UIApplication sharedApplication].keyWindow;
+              return win;
+          }
+
+          static UIButton *makeButton(NSString *title, SEL sel, CGRect frame) {
+              UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+              b.frame = frame;
+              b.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.55];
+              b.layer.cornerRadius = 6;
+              b.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+              [b setTitle:title forState:UIControlStateNormal];
+              [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+              [b addTarget:nil action:sel forControlEvents:UIControlEventTouchUpInside];
+              return b;
+          }
+
+          static UIView *gPanel = nil;
+
+          @interface TweakPanTarget : NSObject
+          + (instancetype)shared;
+          - (void)onPan:(UIPanGestureRecognizer *)g;
+          @end
+
+          @implementation TweakPanTarget
+          + (instancetype)shared {
+              static TweakPanTarget *s = nil;
+              static dispatch_once_t once;
+              dispatch_once(&once, ^{ s = [TweakPanTarget new]; });
+              return s;
+          }
+          - (void)onPan:(UIPanGestureRecognizer *)g {
+              UIView *v = g.view;
+              if (!v) return;
+              CGPoint t = [g translationInView:v.superview];
+              CGPoint c = v.center;
+              c.x += t.x;
+              c.y += t.y;
+
+              UIView *sup = v.superview;
+              CGFloat halfW = v.bounds.size.width / 2, halfH = v.bounds.size.height / 2;
+              c.x = MAX(halfW + 4, MIN(sup.bounds.size.width - halfW - 4, c.x));
+              c.y = MAX(halfH + 4, MIN(sup.bounds.size.height - halfH - 4, c.y));
+              v.center = c;
+              [g setTranslation:CGPointZero inView:v.superview];
+          }
+          @end
+
+          static void makeUI(void) {
+              UIWindow *win = keyWindow();
+              if (!win) return;
+              CGFloat top = 44;
+
+              UIView *panel = [[UIView alloc] initWithFrame:CGRectMake(14, top, 128, 64)];
+              panel.backgroundColor = [UIColor clearColor];
+              [win addSubview:panel];
+              gPanel = panel;
+
+              UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
+                  initWithTarget:[TweakPanTarget shared] action:@selector(onPan:)];
+              [panel addGestureRecognizer:pan];
+
+              UILabel *lab = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 96, 26)];
+              lab.text = @"-- FPS";
+              lab.textColor = [UIColor colorWithRed:0.4 green:1.0 blue:0.4 alpha:1.0];
+              lab.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.5];
+              lab.font = [UIFont fontWithName:@"Menlo-Bold" size:15] ?: [UIFont boldSystemFontOfSize:15];
+              lab.textAlignment = NSTextAlignmentCenter;
+              lab.layer.cornerRadius = 6;
+              lab.layer.masksToBounds = YES;
+              lab.userInteractionEnabled = NO;
+              [panel addSubview:lab];
+              gFpsLabel = lab;
+
+              gSpeedBtn = makeButton(@"1.0x", @selector(tweakSpeedTapped:), CGRectMake(0, 32, 60, 30));
+              [panel addSubview:gSpeedBtn];
+              gHideBtn = makeButton(@"隐藏", @selector(tweakHideTapped:), CGRectMake(68, 32, 54, 30));
+              [panel addSubview:gHideBtn];
+
+              gLink = [CADisplayLink displayLinkWithTarget:[TweakTickTarget shared] selector:@selector(onTick:)];
+              [gLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+          }
+
+          #pragma mark - actions
+
+          @interface NSObject (TweakActions2)
+          - (void)tweakSpeedTapped:(id)sender;
+          - (void)tweakHideTapped:(id)sender;
+          @end
+
+          @implementation NSObject (TweakActions2)
+          - (void)tweakSpeedTapped:(id)sender {
+              double next = 1.0;
+              if (gSpeed < 1.5) next = 2.0;
+              else if (gSpeed < 2.5) next = 3.0;
+              else next = 1.0;
+
+              pthread_mutex_lock(&gTimeLock);
+              gSpeed = next;
+              gScaling = (next > 1.0001) ? 1 : 0;
+              gLastReal = 0;
+              gVirtual = 0;
+              pthread_mutex_unlock(&gTimeLock);
+
+              [gSpeedBtn setTitle:[NSString stringWithFormat:@"%.1fx", next] forState:UIControlStateNormal];
+          }
+
+          - (void)tweakHideTapped:(id)sender {
+              BOOL hidden = gFpsLabel.hidden;
+              gFpsLabel.hidden = !hidden;
+              gSpeedBtn.hidden = !hidden;
+              [gHideBtn setTitle:(hidden ? @"隐藏" : @"显示") forState:UIControlStateNormal];
+          }
+          @end
+
+          #pragma mark - 启动
+
+          __attribute__((constructor))
+          static void tweak2_init(void) {
+              gOrigMachAbs = (mach_abs_fn)dlsym(RTLD_NEXT, "mach_absolute_time");
+
+              dispatch_async(dispatch_get_main_queue(), ^{
+                  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                                 dispatch_get_main_queue(), ^{
+                      makeUI();
+                  });
+              });
+
+              NSTimer *timer = [NSTimer timerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
+                  static NSUInteger last = 0;
+                  NSUInteger now = gTicks;
+                  NSUInteger delta = now - last;
+                  last = now;
+                  if (gFpsLabel) gFpsLabel.text = [NSString stringWithFormat:@"%lu FPS", (unsigned long)delta];
+              }];
+              [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
+          }
+          TWEAK_EOF
+          wc -l src/Tweak2.m
+
+      - name: Build
+        run: |
+          set -e
+          mkdir -p out
+          xcrun --sdk iphoneos clang \
+            -arch arm64 -dynamiclib -O2 -fobjc-arc \
+            -miphoneos-version-min=12.0 \
+            -install_name "@executable_path/Tweak2.dylib" \
+            -framework UIKit -framework Foundation -framework QuartzCore \
+            -o out/Tweak2.dylib src/Tweak2.m
+          xcrun lipo -info out/Tweak2.dylib
+          ls -la out
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-dylibs
+          path: out/*.dylib
+          if-no-files-found: error
